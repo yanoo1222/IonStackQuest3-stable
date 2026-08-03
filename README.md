@@ -31,7 +31,7 @@ Root exploit for Meta Quest 3, adapted from [IonStack (CVE-2026-43499)](https://
 
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### If Your Firmware Matches the Default (`52168470043600520`)
 
