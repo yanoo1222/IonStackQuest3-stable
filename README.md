@@ -19,6 +19,89 @@ IonStackQuest3/
 └── Makefile                  ← Build system
  ```
 
+# to adjust for your build version(ai genarated) 
+```
+Step 1: Create the target directory
+# For their specific firmware version
+mkdir -p src/targets/eureka-521684700XYZ12345
+Step 2: Create target.h
+```
+
+```
+bash
+# Copy from an existing target
+cp src/targets/eureka-52168470043600520/target.h \
+   src/targets/eureka-521684700XYZ12345/target.h
+
+# Edit the offsets
+nano src/targets/eureka-521684700XYZ12345/target.h
+Step 3: Update the offsets
+```
+
+
+They need to find the offsets for their firmware. Here's how:
+
+🔍 How to Find Offsets for ANY Quest 3 Firmware
+Tool 1: gen_ionstack_config.py (If you have kernel.elf)
+bash
+# Download their firmware
+wget https://files.cocaine.trade/firmware/meta/Quest%203/q3_521684700XYZ12345.zip
+
+# Extract kernel.elf
+unzip q3_521684700XYZ12345.zip kernel.elf
+
+# Generate the config
+python3 scripts/gen_ionstack_config.py kernel.elf ionstack ionstack_xyz.conf
+Tool 2: Extract from Running Device (If they have root)
+bash
+# On the Quest 3 (as root):
+cat /proc/kallsyms > /sdcard/kallsyms.txt
+cat /proc/kallsyms | grep -E "_text|init_task|ashmem|selinux" > /sdcard/symbols.txt
+
+# Pull to PC
+adb pull /sdcard/symbols.txt
+
+# Calculate offsets:
+# offset = runtime_address - KASLR_base
+# KASLR_base is printed by the exploit (e.g., base=ffffffda50600000)
+Tool 3: Manual Symbol Extraction
+bash
+# Get the kernel text base (needed to calculate offsets)
+adb shell "cat /proc/kallsyms | grep ' _text$'"
+
+# Get specific symbols
+adb shell "cat /proc/kallsyms | grep -E ' ashmem_misc$| ashmem_fops$| init_task$'"
+
+# Example output:
+# ffffffda52a42198 B selinux_state
+# ffffffda527ec200 D init_task
+# ffffffda50819688 D ashmem_misc
+What Offsets Need to Be Updated
+Critical offsets in target.h:
+
+c
+// KASLR / Memory Layout
+#define KIMAGE_TEXT_BASE_DEFAULT 0xffffffc008000000ULL
+#define P0_PAGE_OFFSET 0xffffff8000000000ULL
+#define P0_PHYS_OFFSET 0x80000000ULL
+#define P0_KERNEL_PHYS_LOAD 0xA8000000ULL
+
+// ASHMEM - The main exploit target
+#define ASHMEM_MISC_FOPS_OFF 0x2819688    // miscdevice fops slot
+#define ASHMEM_FOPS_OFF 0x01ec7f20        // ashmem_fops table
+#define ASHMEM_IOCTL_OFF 0x143a040        // CFI thunks
+
+// KERNEL VARIABLES
+#define INIT_TASK_OFF 0x027ec200
+#define ROOT_TASK_GROUP_OFF 0x028f0700
+
+// SELINUX (Critical for su daemon)
+#define SELINUX_ENFORCING_OFF 0x02a42199  // +1 offset fix!
+#define SELINUX_BLOB_SIZES_OFF 0x01f044f0
+
+// SLIDE INFOLAK
+#define SLIDE_RANDOM_BOOT_ID_DATA_OFF 0x027e6478
+#define SLIDE_SYSCTL_BOOTID_OFF 0x02a4f1d9
 
 
 ## Device Info
