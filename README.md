@@ -555,16 +555,3 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
-
-## Final Notes
-
-**This exploit is the result of extensive research and testing.** While it works reliably on supported devices, always:
-
-1. **Read the documentation thoroughly** before running
-2. **Back up your data** before experimenting
-3. **Understand the risks** involved in kernel-level exploits
-4. **Use responsibly** - this is for research and educational purposes
-
----
-
-*Made with ❤️ by the Quest 3 modding community*
