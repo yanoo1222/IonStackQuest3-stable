@@ -43,6 +43,7 @@ They need to find the offsets for their firmware. Here's how:
 
 🔍 How to Find Offsets for ANY Quest 3 Firmware
 Tool 1: gen_ionstack_config.py (If you have kernel.elf)
+```
 bash
 # Download their firmware
 wget https://files.cocaine.trade/firmware/meta/Quest%203/q3_521684700XYZ12345.zip
@@ -102,7 +103,7 @@ c
 // SLIDE INFOLAK
 #define SLIDE_RANDOM_BOOT_ID_DATA_OFF 0x027e6478
 #define SLIDE_SYSCTL_BOOTID_OFF 0x02a4f1d9
-
+```
 
 ## Device Info
 
