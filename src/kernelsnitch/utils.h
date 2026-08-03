@@ -36,6 +36,28 @@
 #define COLOR_YELLOW "\033[33m"
 #define COLOR_DEFAULT "\033[0m"
 
+/*
+ * pr_file — durable progress log. Every pr_* line is also appended to
+ * /data/local/tmp/preload.log with fsync so it survives a kernel panic
+ * / reboot (plain stdout writes are lost when the device dies).
+ */
+#include <stdarg.h>
+static inline void pr_file(const char *fmt, ...) {
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (n <= 0) return;
+  int fd = open("/data/local/tmp/preload.log",
+                O_WRONLY | O_CREAT | O_APPEND, 0644);
+  if (fd >= 0) {
+    (void)write(fd, buf, (size_t)n);
+    (void)fsync(fd);
+    (void)close(fd);
+  }
+}
+
 #define SYSCHK(x) ({ \
         typeof(x) __res = (x); \
         if (__res == (typeof(x))-1) \
@@ -81,16 +103,20 @@
     } while (0)
 #else
 #define pr_error(fmt, ...) do { \
+        pr_file(fmt, ##__VA_ARGS__); \
         printf(COLOR_RED "[!] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
         exit(-1); \
     } while (0)
 #define pr_warning(fmt, ...) do { \
+        pr_file(fmt, ##__VA_ARGS__); \
         printf(COLOR_RED "[-] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
     } while (0)
 #define pr_info(fmt, ...) do { \
+        pr_file(fmt, ##__VA_ARGS__); \
         printf(COLOR_YELLOW "[*] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
     } while (0)
 #define pr_success(fmt, ...) do { \
+        pr_file(fmt, ##__VA_ARGS__); \
         printf(COLOR_GREEN "[+] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
     } while (0)
 #endif
@@ -111,16 +137,20 @@
     } while (0)
 #else
 #define pr_error(fmt, ...) do { \
+        pr_file(fmt, ##__VA_ARGS__); \
         printf(COLOR_RED "[!] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
         exit(-1); \
     } while (0)
 #define pr_warning(fmt, ...) do { \
+        pr_file(fmt, ##__VA_ARGS__); \
         printf(COLOR_RED "[-] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
     } while (0)
 #define pr_info(fmt, ...) do { \
+        pr_file(fmt, ##__VA_ARGS__); \
         printf(COLOR_YELLOW "[*] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
     } while (0)
 #define pr_success(fmt, ...) do { \
+        pr_file(fmt, ##__VA_ARGS__); \
         printf(COLOR_GREEN "[+] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
     } while (0)
 #endif
