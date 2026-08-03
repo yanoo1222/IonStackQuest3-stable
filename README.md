@@ -6,7 +6,7 @@ Root exploit for Meta Quest 3, adapted from [IonStack (CVE-2026-43499)](https://
 
 ---
 
-## 📖 Overview
+##  Overview
 
 **IonStackQuest3** is a privilege escalation exploit for the Meta Quest 3 that leverages CVE-2026-43499 (IonStack) to gain root access. It features:
 
