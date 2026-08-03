@@ -4,6 +4,22 @@ Root exploit for Meta Quest 3, adapted from IonStack (CVE-2026-43499) in [CyberM
 
 # Use at your own risk!!!
 
+```
+IonStackQuest3/
+├── src/
+│   ├── targets/              ← Target-specific offsets
+│   │   ├── eureka-52168470043600520/
+│   │   │   └── target.h      ← Offsets for that firmware
+│   │   └── eureka-52168470052900520/
+│   │       └── target.h      ← Offsets for this firmware
+│   ├── config.c              ← Runtime overrides
+│   ├── preload.c             ← Main exploit logic
+│   └── ...
+├── ionstack.conf             ← Runtime config (overrides compiled offsets)
+└── Makefile                  ← Build system
+ ```
+
+
 
 ## Device Info
 
