@@ -19,7 +19,7 @@ IonStackQuest3/
 └── Makefile                  ← Build system
  ```
 
-# to adjust for your build version(ai genarated) 
+# to adjust for your build version(ai generated) 
 ```
 Step 1: Create the target directory
 # For their specific firmware version
